@@ -1,4 +1,44 @@
-# Obsidian Edit History Plugin
+# Obsidian Edit History — External Backups fork
+
+This fork of [Antonio Tejada's Edit History](https://github.com/antoniotejada/obsidian-edit-history) adds a configurable external backup directory for desktop filesystem vaults. It retains the upstream plugin ID (`edit-history`), settings, `.edtz` format, and history viewer.
+
+## External backup directory (0.4.0)
+
+1. Open **Settings → Edit History (External Backups)**.
+2. Enter a full directory such as `D:\Obsidian Backups` in **External backup directory** and click **Apply**. Quoted paths, spaces, Unicode, and UNC network paths such as `\\server\share\Backups` are supported. The directory is created if needed and checked for write access before the setting is saved. Paths inside the vault are rejected.
+3. Before editing notes at the new location, click **Copy history** to copy existing vault `.edtz` files. Originals are retained; files already present in the destination are skipped without merging or overwriting.
+
+Each vault gets a separate subfolder, identified by its name and a short hash of its absolute vault path. Note folders are mirrored inside it, for example `D:\Obsidian Backups\My Vault-a1b2c3d4e5f6\Notes\Example.md.edtz`. The settings show the complete location. Different vaults may use the same backup directory, including vaults with identical names.
+
+Leave the field empty and click **Apply** to restore vault storage. Changing the directory never automatically moves or deletes existing archives. **Copy history** imports from the vault only; changing between external directories requires copying the vault subfolder in Windows Explorer. When moving or renaming the vault itself, its hash/subfolder changes: copy the old vault subfolder's contents into the newly displayed subfolder to retain access to external history.
+
+History saves, viewing, note moves/renames, folder renames, and deletions all use the selected location. As in upstream, deleting a note deletes its active history archive; this is revision history, not an independent undelete system. Preserved vault originals from an import are not deleted automatically. Unavailable or unwritable external storage raises a notice and does not silently save inside the vault. A network drive needs to be available whenever histories are saved or viewed. External storage requires desktop Obsidian; leave the setting blank on mobile.
+
+## Install this fork
+
+Download from [this fork's releases](https://github.com/neuronsarealsocool/obsidian-edit-history/releases/latest).
+
+### Replace an existing Edit History installation
+
+1. Turn off **Edit History** in the vault's Community plugins settings, then close that vault's Obsidian window.
+2. Keep a copy of the existing `.obsidian/plugins/edit-history` folder. Extract `edit-history-install-0.4.0.zip` and copy its `main.js`, `manifest.json`, and `styles.css` into that folder, replacing those three files. Keep your existing `data.json` and all `.edtz` archives.
+3. Reopen the vault and enable **Edit History (External Backups)**, then configure the directory using the steps above. Repeat for each vault.
+
+The original and fork share an ID and replace each other. Updating from the standard community plugin listing can replace the fork with upstream, so manage updates from this fork instead.
+
+### BRAT / new installation
+
+In BRAT, add `neuronsarealsocool/obsidian-edit-history` as a beta plugin repository. Releases include `main.js`, `manifest.json`, and `styles.css` as direct assets for BRAT. For a pre-existing installation, the manual replacement steps above preserve your settings; use BRAT's repository tracking/update controls if you want BRAT to manage future fork releases.
+
+### Development
+
+Use Node.js 18 or newer. Run `npm ci`, then `npm test` (TypeScript check, production build, Windows filesystem tests, and plugin integration tests with a simulated Obsidian DOM). `npm run build` writes `main.js` in the checkout only; it never copies files into installed vaults. `npm run dev` watches source changes. Runtime dependencies and the AGPL-3.0 license are inherited from upstream.
+
+The AI-ready full-folder release zip contains source, tests, configuration, the lockfile, license, and compiled plugin assets. It excludes `.git`, dependencies, and private runtime settings.
+
+---
+
+## Upstream documentation
 
 This plugin saves each edit done to a note into a edit history file, the edits can later be diffed or copied.
 
@@ -46,7 +86,7 @@ This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+rec
 
 ## The edit history file
 
-The plugin creates one edit history (.edtz) file per note, in the same folder as the note. 
+By default the plugin creates one edit history (.edtz) file per note in the same folder as the note. This fork can place those archives in an external directory as described above.
 
 ### Format
 
@@ -98,8 +138,7 @@ Each entry in the file is named after the UTC epoch in seconds at which time the
 ### [0.1.0](https://github.com/antoniotejada/obsidian-edit-history/releases/tag/0.1.2) (2023-06-17)
 - First fully functional version
 
-## TODO
-- Allow specifying the edit history root folder?
+## Upstream TODO
 - Restore a given edit
 - Diff one edit against another arbitrary edit
 - Abstract out/refactor access to the edit history file

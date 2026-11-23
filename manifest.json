@@ -1,10 +1,10 @@
 {
 	"id": "edit-history",
-	"name": "Edit History",
-	"version": "0.3.0",
+	"name": "Edit History (External Backups)",
+	"version": "0.4.0",
 	"minAppVersion": "0.15.0",
-	"description": "Automatically saves the history of edits of a file when Obsidian saves the file, and allows viewing the differences between edits, copying text from a previous edit, or fully rolling back to a previous edit.",
-	"author": "Antonio Tejada",
-	"authorUrl": "https://github.com/antoniotejada/",
+	"description": "Save and browse note edit history, with an optional external backup directory and separate storage for each vault.",
+	"author": "Antonio Tejada; external-backup fork by neuronsarealsocool",
+	"authorUrl": "https://github.com/neuronsarealsocool/obsidian-edit-history",
 	"isDesktopOnly": false
 }

@@ -2,6 +2,7 @@ import {
     App, 
     ButtonComponent, 
     DropdownComponent,
+    FileSystemAdapter,
     Modal, 
     normalizePath, 
     Notice,
@@ -14,6 +15,7 @@ import {
     TFolder, 
     ToggleComponent
 } from "obsidian";
+import { HistoryStorage, HistoryStat } from "./history-storage";
 import { DiffMatchPatch, Diff } from "diff-match-patch-ts";
 // diff-match-patch-ts doesn't export properly module enums, it uses a const
 // enum (instead of a non const enum) which is removed at compile time and not
@@ -116,6 +118,7 @@ interface EditHistorySettings {
     maxEditAge: string;
     maxHistoryFileSizeKB: string;
     editHistoryRootFolder: string;
+    externalBackupDirectory: string;
     extensionWhitelist: string;
     substringBlacklist: string;
     showOnStatusBar: boolean;
@@ -131,6 +134,7 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     maxEdits: "0",
     maxHistoryFileSizeKB: "0",
     editHistoryRootFolder: "",
+    externalBackupDirectory: "",
     extensionWhitelist: ".md, .txt, .csv, .htm, .html",
     substringBlacklist: "",
     showOnStatusBar: true,
@@ -165,6 +169,54 @@ const EDIT_HISTORY_FILE_EXT = ".edtz";
 export default class EditHistory extends Plugin {
     settings: EditHistorySettings;
     statusBarItemEl: HTMLElement;
+    private historyQueue: Promise<void> = Promise.resolve();
+
+    historyStorage(): HistoryStorage {
+        const adapter = this.app.vault.adapter;
+        return new HistoryStorage(adapter, this.settings.externalBackupDirectory,
+            adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "");
+    }
+
+    queueHistoryOperation(operation: () => Promise<void>): Promise<void> {
+        const pending = this.historyQueue.then(operation);
+        this.historyQueue = pending.catch(error => {
+            console.error("Edit History:", error);
+            new Notice(`Edit History: ${error.message || error}`, 10000);
+        });
+        return this.historyQueue;
+    }
+
+    async waitForHistory(): Promise<void> { await this.historyQueue; }
+
+    async applyBackupDirectory(directory: string): Promise<void> {
+        const pending = this.historyQueue.then(async () => {
+            const adapter = this.app.vault.adapter;
+            directory = directory.trim().replace(/^"(.*)"$/, "$1");
+            const storage = new HistoryStorage(adapter, directory,
+                adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "");
+            if (directory) await storage.validate((adapter as FileSystemAdapter).getBasePath());
+            const previous = this.settings.externalBackupDirectory;
+            this.settings.externalBackupDirectory = directory;
+            try { await this.saveSettings(); }
+            catch (error) { this.settings.externalBackupDirectory = previous; throw error; }
+        });
+        this.historyQueue = pending.catch(() => {});
+        await pending;
+    }
+
+    async importVaultHistory(): Promise<void> {
+        const storage = this.historyStorage();
+        if (!storage.directory) throw new Error("Apply an external backup directory first.");
+        let copied = 0;
+        for (const file of this.app.vault.getFiles()) {
+            if (!file.path.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+            if (this.editHistoryRootFolder && !file.path.startsWith(this.editHistoryRootFolder + "/")) continue;
+            if (await storage.stat(file.path)) continue;
+            await storage.write(file.path, await this.app.vault.readBinary(file));
+            copied++;
+        }
+        new Notice(`Copied ${copied} history files. Existing external history and vault originals were kept.`, 10000);
+    }
 
     // Minimum number of milliseconds between edits or Infinity, if a
     // modification occurs before that time will be ignored at this moment and
@@ -346,7 +398,7 @@ export default class EditHistory extends Plugin {
 
         logInfo("onLoad");
 
-        this.registerEvent(this.app.vault.on("modify", async (fileOrFolder: TAbstractFile, force: boolean = false) => {
+        this.registerEvent(this.app.vault.on("modify", (fileOrFolder: TAbstractFile, force: boolean = false) => this.queueHistoryOperation(async () => {
             logInfo("vault modify", fileOrFolder.path);
             // This reports any files or folders modified via the api, ignore
             // non whitelisted files/folders
@@ -365,12 +417,8 @@ export default class EditHistory extends Plugin {
 
             let file = fileOrFolder as TFile;
             let zipFilepath = this.getEditHistoryFilepath(file.path);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if ((zipFile != null) && !(zipFile instanceof TFile)) {
-                // Not a file, error
-                logError("Edit history file is not a file", zipFilepath);
-                return;
-            }
+            const storage = this.historyStorage();
+            const zipFile = await storage.stat(zipFilepath);
             
             // XXX Cleanup all naming:
             //
@@ -437,9 +485,9 @@ export default class EditHistory extends Plugin {
             //        expires. The timer needs to be per file/editor?
             //     See https://github.com/antoniotejada/obsidian-edit-history/issues/9
             if (!force && 
-                (zipFile != null) && ((file.stat.mtime - zipFile.stat.mtime) < this.minMsBetweenEdits)) {
+                (zipFile != null) && ((file.stat.mtime - zipFile.mtime) < this.minMsBetweenEdits)) {
                 logDbg("Need to pass", 
-                    (this.minMsBetweenEdits - (file.stat.mtime - zipFile.stat.mtime)) / 1000, "s between edits, ignoring");
+                    (this.minMsBetweenEdits - (file.stat.mtime - zipFile.mtime)) / 1000, "s between edits, ignoring");
                 return;
             }
 
@@ -481,7 +529,7 @@ export default class EditHistory extends Plugin {
 
             // Create or open the zip with the versions of this file
             let zip: JSZip = new JSZip();
-            let zipData = (zipFile == null) ? null : await this.app.vault.readBinary(zipFile);
+            let zipData = (zipFile == null) ? null : await storage.read(zipFilepath);
             let numEdits = 0;
             if (zipData != null) {
                 // There's an existing zip file, update the most recent
@@ -648,37 +696,19 @@ export default class EditHistory extends Plugin {
             
             // Generate zip archive and save
             let newZipData = await zip.generateAsync({type: "arraybuffer", compression: "DEFLATE"});
-            if (zipFile == null) {
-                // No existing zip file, create
-                
-                // The directory may not exist if history files are not saved
-                // alongside notes, and createBinary won't create the directory,
-                // so create it here. Do it unconditionally for simplicity and
-                // ignore errors, let createBinary fail if there was a problem
-                
-                // XXX Obsidian has issues with directories starting with "." :
-                //     - createBinary succeeds in creating the binary in a
-                //       directory starting with "." but returns null instead of a TFile
-                //     - createFolder succeeds in creating a folder starting with "."
-                //     - getAbstractFileByPath of a path starting with "." returns null
-                let dirpath = zipFilepath.substring(0, zipFilepath.lastIndexOf("/")+1);
-                logInfo("Conservatively creating dir", dirpath);
-                await this.app.vault.createFolder(dirpath).catch(()=>null);
-                let zipFile = await this.app.vault.createBinary(zipFilepath, newZipData);
-                if (zipFile == null) {
-                    logError("Can't create edit history file", zipFilepath);
-                    return;
-                }
-            } else {
-                // Update the zip file
-                await this.app.vault.modifyBinary(zipFile, newZipData);
-            }
+            await storage.write(zipFilepath, newZipData);
             // XXX This needs to update when switching panes, etc, or set a timer
             this.statusBarItemEl.setText((numEdits + 1) + " edits");
-        }));
+        })));
         
-        this.registerEvent(this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+        this.registerEvent(this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => this.queueHistoryOperation(async () => {
             logInfo("vault rename path", file.path);
+            if (file instanceof TFolder && this.settings.externalBackupDirectory) {
+                await this.historyStorage().renameFolder(
+                    normalizePath(this.editHistoryRootFolder + "/" + oldPath),
+                    normalizePath(this.editHistoryRootFolder + "/" + file.path));
+                return;
+            }
             // This reports any files or folders modified via the api, ignore
             // non whitelisted files/folders
             // Note if a folder is renamed each children will get a call here
@@ -717,41 +747,24 @@ export default class EditHistory extends Plugin {
             const filedirs = file.path.split("/");
             const filename = filedirs.pop();
             const parentFolder = (filedirs.length > 0) ? filedirs.pop() : "";
-            if ((this.settings.editHistoryRootFolder == "") && 
+            if (!this.settings.externalBackupDirectory && (this.settings.editHistoryRootFolder == "") &&
                 ((oldParentFolder == parentFolder) && (oldFilename == filename))) {
                 logDbg("Not moving edit history, expected to be moved later alongside parent folder");
                 return;
             }
 
-            // Rename the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(oldPath);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                let newZipFilepath = this.getEditHistoryFilepath(file.path);
-                logInfo("Renaming edit history file", zipFilepath,"to", newZipFilepath);
-                this.app.vault.rename(zipFile, newZipFilepath);
-            }
-        }));
+            const storage = this.historyStorage();
+            await storage.rename(this.getEditHistoryFilepath(oldPath), this.getEditHistoryFilepath(file.path));
+        })));
 
-        this.registerEvent(this.app.vault.on("delete", (file: TAbstractFile) => {
-            logInfo("vault delete path", file.path);
-            // This reports any files or folders modified via the api, ignore
-            // non whitelisted files/folders
-            if (!(this.keepEditHistoryForFile(file))) {
-                logDbg("Ignoring non whitelisted file", file.path);
+        this.registerEvent(this.app.vault.on("delete", (file: TAbstractFile) => this.queueHistoryOperation(async () => {
+            if (file instanceof TFolder && this.settings.externalBackupDirectory) {
+                await this.historyStorage().removeFolder(normalizePath(this.editHistoryRootFolder + "/" + file.path));
                 return;
             }
-            // Delete the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(file.path);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                logInfo("Deleting edit history file", zipFilepath);
-                // XXX Should this trash instead of delete? (the Obsidian
-                //     setting under Files and Links allows choosing between
-                //     system trash, obsidian trash and delete)
-                this.app.vault.delete(zipFile);
-            }
-        }));
+            if (!this.keepEditHistoryForFile(file)) return;
+            await this.historyStorage().remove(this.getEditHistoryFilepath(file.path));
+        })));
 
         // XXX Use notices for some information/error messages
 
@@ -826,7 +839,7 @@ class EditHistoryModal extends Modal {
         this.plugin = plugin;
     }
 
-    renderCalendar(calendarDiv: HTMLElement, select: DropdownComponent, zipFile: TFile, zip: JSZip, filepaths: string[]) {
+    renderCalendar(calendarDiv: HTMLElement, select: DropdownComponent, zipFile: HistoryStat, zip: JSZip, filepaths: string[]) {
         // XXX Abstract this more? problems are revstats requiring the zip file
         //     or recalculate values outside. select should also be removed and
         //     take a cell onclick callback or do the cell onclick in the caller?
@@ -987,7 +1000,7 @@ class EditHistoryModal extends Modal {
         // XXX Use human friendly units (KB, MB, GB, etc)
         revStats.setText(
             `${numFiles}/${filepaths.length} edit${(filepaths.length > 1) ? "s " : " "}` +
-            `${fileSize}/${(zipFile as TFile).stat.size} bytes compressed, ${this.app.workspace.getActiveFile()?.stat.size} note bytes`
+            `${fileSize}/${zipFile.size} bytes compressed, ${this.app.workspace.getActiveFile()?.stat.size} note bytes`
         );
     }
 
@@ -1328,17 +1341,19 @@ class EditHistoryModal extends Modal {
         const zip: JSZip = new JSZip();
         const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
         logInfo("Opening zip file ", zipFilepath);
-        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-        if ((zipFile == null) || (!(zipFile instanceof TFile))) {
-            logWarn("No history file or not a file", zipFilepath);
-            contentEl.createEl("p", { text: "No edit history file"});
-            return;
-        }
-        
-        const zipData = await this.app.vault.readBinary(zipFile);
-        if (zipData == null) {
-            logWarn("Unable to read history file");
-            contentEl.createEl("p", { text: "No edit history"});
+        await this.plugin.waitForHistory();
+        let zipFile: HistoryStat | null;
+        let zipData: ArrayBuffer;
+        try {
+            const storage = this.plugin.historyStorage();
+            zipFile = await storage.stat(zipFilepath);
+            if (!zipFile) {
+                contentEl.createEl("p", { text: "No edit history file at the current backup location." });
+                return;
+            }
+            zipData = await storage.read(zipFilepath);
+        } catch (error) {
+            contentEl.createEl("p", { text: `Unable to read edit history: ${error.message || error}` });
             return;
         }
 
@@ -1491,7 +1506,7 @@ class EditHistoryModal extends Modal {
                 selectedDayCell.addClass("calendar-selected");
                 selectedDayCell.removeClass("calendar-level");
             } else {
-                this.renderCalendar(calendarDiv, select, zipFile as TFile, zip, filepaths);
+                this.renderCalendar(calendarDiv, select, zipFile!, zip, filepaths);
                 selectedDayCell = document.getElementById(`calendar-${selectedFileTime}`) as HTMLElement|null;
             }
 
@@ -1716,6 +1731,42 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
         // size (other plugins do the same)
         containerEl.createEl("h3", {text: "General"});
 
+        let pendingDirectory = this.plugin.settings.externalBackupDirectory;
+        const location = containerEl.createEl("p", { text: "" });
+        const updateLocation = () => {
+            try {
+                location.setText("Current backup location: " + (this.plugin.historyStorage().directory || "Inside this vault (original behavior)"));
+            } catch (error) { location.setText(`Backup location unavailable: ${error.message || error}`); }
+        };
+        updateLocation();
+        new Setting(containerEl)
+            .setName("External backup directory")
+            .setDesc("Desktop only. Enter a full Windows directory or UNC network path, then click Apply. A separate subfolder is created for each vault. Leave empty to save inside the vault. Changing location does not move existing history.")
+            .addText(text => text
+                .setPlaceholder("D:\\Obsidian Backups")
+                .setValue(pendingDirectory)
+                .onChange(value => { pendingDirectory = value; }))
+            .addButton(button => button.setButtonText("Apply").setCta().onClick(async () => {
+                button.setDisabled(true);
+                try {
+                    await this.plugin.applyBackupDirectory(pendingDirectory);
+                    updateLocation();
+                    new Notice("Backup directory saved.");
+                } catch (error) { new Notice(`Backup directory was not changed: ${error.message || error}`, 10000); }
+                finally { button.setDisabled(false); }
+            }));
+
+        new Setting(containerEl)
+            .setName("Copy existing vault history")
+            .setDesc("After applying an external directory, copy existing .edtz history files from this vault. Existing destination files are skipped and the originals are kept. Run this before editing notes at the new location to continue their existing histories.")
+            .addButton(button => button.setButtonText("Copy history").onClick(async () => {
+                button.setDisabled(true);
+                await this.plugin.queueHistoryOperation(async () => {
+                    try { await this.plugin.importVaultHistory(); }
+                    finally { button.setDisabled(false); }
+                });
+            }));
+
         new Setting(containerEl)
             .setName("Minimum seconds between edits")
             .setDesc("Minimum number of seconds that must pass from the previous edit to store a new edit, set to 0 to disable. Modifications done between those seconds will be merged into the next edit, reducing the edit history file size at the expense of less history granularity.")
@@ -1841,76 +1892,7 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                 }));
 
 
-        /* XXX Issues with allowing a user-configured history folder: 
-            - any history folder will mimic the the structure of the note
-              directory (alternatively history files could be on a flat
-              directory with the name coming from a hash of the full path, but
-              that makes renaming more involved, and fishing for history files
-              less intuitive)
 
-            - due to an Obsidian design decision, folders cannot start with "."
-              so the user-defined history folder be visible in the file explorer
-                - Note this limitation is not consistently enforced through the
-                    API:
-                    - Obsidian does allow createBinary on a path starting with a
-                      dot and it successfully creates the file
-                    - Unfortunately getAbstractFileFromPath on a path starting
-                      with a dot fails so the file can be created (which only
-                      requires the path) but not modified (which requires a
-                      TAbstractFile)
-
-            - because it's visible, the user can rename the edit history folder
-              from the obsidian UI,
-                - renaming the topmost directory could be supported since the
-                  only thing needed would be to update the internal variable.
-                  Obisidan API notifies of the top level rename and each
-                  children, which can be ignored. This will need care depending
-                  on the reporting order of root vs. children and the update of
-                  the internal variable.
-                - if the user renames a non-top level directory then all
-                  children history files would go out of sync, so this is a
-                  problem.
-
-            - the Obsidian setting onChange gets called on every keystroke, so
-               configuring the edit history folder in settings would cause a
-               rename on each keystroke. There doesn't seem to be a final
-               changed(), hide() is not called either
-
-            - it's not clear whether the folder should be deleted if empty
-
-            - it's not clear if it's safe to just copy all the files found with
-              whatever extension new Setting(containerEl) .setName('Edits
-              folder') .setDesc('Folder to store the edit history file. Empty to
-              store the edit file in the same directory alongside the original
-              file. Due to Obsidian limitations this must start with a character
-              other than "."') .addText(text => text .setPlaceholder('Enter the
-              folder name')
-              .setValue(this.plugin.settings.editHistoryRootFolder)
-              .onChange(async (value) => { logInfo("onChange"); logInfo('Edits
-              folder: ' + value); // Only allow top level folders
-
-                    this.plugin.settings.editHistoryRootFolder = value;
-
-
-            XXX Can the folder just be renamed via the file explorer
-            interface? 
-
-            XXX Check no dir component starts with "." 
-
-            XXX Delete edits? copy them to new folder? trash them? 
-
-            XXX Ask the user to delete folder? 
-
-            XXX Ask for confirmation? 
-
-            XXX Use private apis to store in some hidden folder? 
-
-            XXX This could use the adapter apis instead of the vault apis //
-            be able to access the .obsidian dir? (or any other?)
-
-            XXX The directory doesn't need to be created on every keystroke,
-            it could have a create/commit button?
-        */
 
 
 }
