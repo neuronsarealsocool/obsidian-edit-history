@@ -16,6 +16,7 @@ import {
     ToggleComponent
 } from "obsidian";
 import { HistoryStorage, HistoryStat } from "./history-storage";
+import {MobileJournalReader, MobileRecord, mobileTime, JOURNAL_ROOT} from './mobile-journal';
 import { DiffMatchPatch, Diff } from "diff-match-patch-ts";
 // diff-match-patch-ts doesn't export properly module enums, it uses a const
 // enum (instead of a non const enum) which is removed at compile time and not
@@ -170,6 +171,12 @@ export default class EditHistory extends Plugin {
     settings: EditHistorySettings;
     statusBarItemEl: HTMLElement;
     private historyQueue: Promise<void> = Promise.resolve();
+    private stopped = false;
+    private mobileReader?: MobileJournalReader;
+    private mobileSeen = new Set<string>();
+    private reconciling?: Promise<void>;
+    private pendingSaves = new Map<string,number>();
+    lastHistoryError = '';
 
     historyStorage(): HistoryStorage {
         const adapter = this.app.vault.adapter;
@@ -180,6 +187,7 @@ export default class EditHistory extends Plugin {
     queueHistoryOperation(operation: () => Promise<void>): Promise<void> {
         const pending = this.historyQueue.then(operation);
         this.historyQueue = pending.catch(error => {
+            this.lastHistoryError = String(error.message || error);
             console.error("Edit History:", error);
             new Notice(`Edit History: ${error.message || error}`, 10000);
         });
@@ -253,6 +261,11 @@ export default class EditHistory extends Plugin {
             return false;
         }
 
+        return this.keepEditHistoryForPath(file.path);
+    }
+    keepEditHistoryForPath(filepath: string): boolean {
+        if (filepath === JOURNAL_ROOT || filepath.startsWith(JOURNAL_ROOT + '/') || filepath.split('/').some(part => part.startsWith('.'))) return false;
+        const file = {path: filepath, name: filepath.split('/').pop()!};
         // The vault will call on change callback on the edit history file when
         // modified using the Obsidian API, trap it so it's ignored downstream
         if (file.name.endsWith(EDIT_HISTORY_FILE_EXT)) {
@@ -343,7 +356,7 @@ export default class EditHistory extends Plugin {
         // to epoch before sorting
         // XXX Could do .length plus < checks, though, removing trailing $ when
         //     necessary)
-        filenames.sort((a,b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a)));
+        filenames.sort((a,b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a) || b.localeCompare(a)));
     }
 
     commaSeparatedToList(s: string) {
@@ -389,16 +402,10 @@ export default class EditHistory extends Plugin {
         this.parseSettings(this.settings);
     }
 
-    async onload() {
-        // Load settings as early as possible console output is seen if enabled
-        await this.loadSettings();
-
-        // XXX Make this a member variable?
-        let dmpobj = new DiffMatchPatch();
-
-        logInfo("onLoad");
-
-        this.registerEvent(this.app.vault.on("modify", (fileOrFolder: TAbstractFile, force: boolean = false) => this.queueHistoryOperation(async () => {
+    async saveFileHistory(fileOrFolder: TAbstractFile, force = false): Promise<void> {
+        if (this.stopped) return;
+        const dmpobj = new DiffMatchPatch();
+        return this.queueHistoryOperation(async () => {
             logInfo("vault modify", fileOrFolder.path);
             // This reports any files or folders modified via the api, ignore
             // non whitelisted files/folders
@@ -486,6 +493,10 @@ export default class EditHistory extends Plugin {
             //     See https://github.com/antoniotejada/obsidian-edit-history/issues/9
             if (!force && 
                 (zipFile != null) && ((file.stat.mtime - zipFile.mtime) < this.minMsBetweenEdits)) {
+                if (!this.pendingSaves.has(file.path)) this.pendingSaves.set(file.path, window.setTimeout(() => {
+                    this.pendingSaves.delete(file.path);
+                    if (!this.stopped && this.app.vault.getAbstractFileByPath(file.path) === file) void this.saveFileHistory(file,true);
+                },Math.max(100,this.minMsBetweenEdits-(Date.now()-zipFile.mtime))+50));
                 logDbg("Need to pass", 
                     (this.minMsBetweenEdits - (file.stat.mtime - zipFile.mtime)) / 1000, "s between edits, ignoring");
                 return;
@@ -536,6 +547,9 @@ export default class EditHistory extends Plugin {
                 // edit in the zip from full to diff wrt the incoming
                 // file
                 await zip.loadAsync(zipData);
+                const existingNames = Object.keys(zip.files).filter(name => !zip.files[name].dir);
+                this.sortEdits(existingNames);
+                if (existingNames.length && await zip.file(existingNames[0]).async('string') === fileData) return;
                 
                 // Read the latest edit which, if it exists, it should
                 // be stored in full (vs diffed)
@@ -619,9 +633,9 @@ export default class EditHistory extends Plugin {
                         // always the case unless there's a forced save.
                         // XXX This could just remove the last change and update
                         //     to this one?
-                        logInfo("Delaying entry due to colliding epochs");
-                        return;
+                        newFilename = this.buildEditFilename(Math.max(Date.now(), this.getEditEpoch(mostRecentFilename) + 1000), false);
                     }
+                    if (this.getEditEpoch(newFilename) < this.getEditEpoch(mostRecentFilename)) newFilename = this.buildEditFilename(Math.max(Date.now(), this.getEditEpoch(mostRecentFilename) + 1000), false);
                     
                     logInfo("unpacking " + mostRecentFilename);
                     let prevFileData = await mostRecentFile.async("string");
@@ -690,7 +704,7 @@ export default class EditHistory extends Plugin {
             // see https://github.com/Stuk/jszip/blob/master/lib/reader/DataReader.js#L113
             // see https://opensource.apple.com/source/zip/zip-6/unzip/unzip/proginfo/extra.fld
             // see https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
-            let dateWithOffset = new Date(file.stat.mtime - new Date().getTimezoneOffset() * 60000);
+            let dateWithOffset = new Date(this.getEditEpoch(newFilename) - new Date().getTimezoneOffset() * 60000);
             logInfo("Storing", newFilename, " with date", dateWithOffset);
             zip.file(newFilename, fileData, { date: dateWithOffset, compression:"DEFLATE" });
             
@@ -698,8 +712,21 @@ export default class EditHistory extends Plugin {
             let newZipData = await zip.generateAsync({type: "arraybuffer", compression: "DEFLATE"});
             await storage.write(zipFilepath, newZipData);
             // XXX This needs to update when switching panes, etc, or set a timer
-            this.statusBarItemEl.setText((numEdits + 1) + " edits");
-        })));
+            this.statusBarItemEl?.setText((numEdits + 1) + " edits");
+        });
+    }
+
+    async onload() {
+        // Load settings as early as possible console output is seen if enabled
+        await this.loadSettings();
+
+        // XXX Make this a member variable?
+        let dmpobj = new DiffMatchPatch();
+
+        logInfo("onLoad");
+
+        this.registerEvent(this.app.vault.on("modify", (file: TAbstractFile, force = false) => this.saveFileHistory(file, force)));
+        this.registerEvent(this.app.vault.on("create", (file: TAbstractFile) => this.saveFileHistory(file)));
         
         this.registerEvent(this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => this.queueHistoryOperation(async () => {
             logInfo("vault rename path", file.path);
@@ -821,9 +848,71 @@ export default class EditHistory extends Plugin {
 
 
         this.addSettingTab(new EditHistorySettingTab(this.app, this));
+        this.mobileReader = new MobileJournalReader(this.app.vault.adapter, (file, error) => console.warn('Edit History: pending mobile record', file, error));
+        this.addCommand({id:'catch-up-offline-history', name:'Catch up synced and offline history', callback:()=>void this.reconcileHistory()});
+        this.app.workspace.onLayoutReady?.(() => { if (!this.stopped) void this.reconcileHistory(); });
+        this.registerInterval(window.setInterval(() => {if (!this.stopped) void this.importMobileHistory();},15000));
     }
 
+    async reconcileHistory(): Promise<void> {
+        if (this.reconciling) return this.reconciling;
+        this.reconciling = (async () => {
+            this.lastHistoryError = '';
+            await this.importMobileHistory();
+            if (this.minMsBetweenEdits === Infinity) return; // Keep manual-only mode manual.
+            for (const file of this.app.vault.getFiles()) {
+                if (this.stopped) return;
+                if (this.keepEditHistoryForFile(file)) await this.saveFileHistory(file, true);
+            }
+        })();
+        try { await this.reconciling; } catch(error) { console.error('Edit History catch-up:',error); new Notice(`Edit History catch-up: ${error.message || error}`,10000); }
+        finally {this.reconciling = undefined;}
+    }
+    async importMobileHistory(): Promise<void> {
+        if (this.stopped || !this.mobileReader || typeof this.app.vault.adapter.exists !== 'function') return;
+        try {
+            const grouped = new Map<string,MobileRecord[]>();
+            for (const record of await this.mobileReader.readAll()) if (!this.mobileSeen.has(record.id) && this.keepEditHistoryForPath(record.path)) {
+                const list = grouped.get(record.path) || []; list.push(record); grouped.set(record.path,list);
+            }
+            for (const [notePath,records] of grouped) {
+                if (this.stopped) return;
+                await this.queueHistoryOperation(async () => {
+                    const storage = this.historyStorage(), archivePath = this.getEditHistoryFilepath(notePath), stat = await storage.stat(archivePath);
+                    const zip = stat ? await JSZip.loadAsync(await storage.read(archivePath)) : new JSZip();
+                    const pending = records.filter(r=>!zip.file(this.buildMobileFilename(r)));
+                    if (!pending.length) {records.forEach(r=>this.mobileSeen.add(r.id)); return;}
+                    // Insert historical versions without changing the meaning of existing backward patches.
+                    const names = Object.keys(zip.files).filter(name=>!zip.files[name].dir); this.sortEdits(names);
+                    const full = new JSZip(); let content: string | undefined;
+                    const dmp = new DiffMatchPatch();
+                    for (const name of names) {
+                        const value = await zip.file(name).async('string');
+                        if (this.getEditIsDiff(name)) {
+                            if (content === undefined) throw Error('The latest existing history entry is not a full snapshot');
+                            const applied = dmp.patch_apply(dmp.patch_fromText(value),content);
+                            if (applied[1].some(ok=>!ok)) throw Error('Existing history could not be reconstructed; archive preserved');
+                            content = applied[0];
+                        } else content = value;
+                        full.file(name.endsWith('$')?name:name+'$',content,{date:zip.file(name).date,comment:zip.file(name).comment || '',compression:'DEFLATE'});
+                    }
+                    for (const record of pending) {
+                        const name = this.buildMobileFilename(record), date = new Date(mobileTime(record));
+                        if (record.kind === 'edit') full.file(name.replace('-1-edit$','-0-before$'),record.previousContent!,{date,comment:'Version immediately before Android observation; prior save time unknown',compression:'DEFLATE'});
+                        full.file(name,record.content,{date,comment:JSON.stringify({android:record.id,capturedAt:record.capturedAt,day:record.day,basis:record.basis}),compression:'DEFLATE'});
+                    }
+                    await storage.write(archivePath,await full.generateAsync({type:'arraybuffer',compression:'DEFLATE'}));
+                    records.forEach(r=>this.mobileSeen.add(r.id));
+                });
+            }
+        } catch(error) {console.error('Edit History mobile import:',error);new Notice(`Edit History mobile import: ${error.message || error}`,10000);}
+    }
+    private buildMobileFilename(record: MobileRecord): string {return this.buildEditFilename(mobileTime(record),false).slice(0,-1)+'~'+record.id+'-1-edit$';}
+
     onunload() {
+        this.stopped = true;
+        for (const timer of this.pendingSaves.values()) window.clearTimeout(timer);
+        this.pendingSaves.clear();
         logInfo("unload");
     }
 }

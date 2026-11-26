@@ -1,5 +1,9 @@
 # Obsidian Edit History — External Backups fork
 
+## Offline catch-up and Android recording (0.5.0)
+
+Eligible notes are reconciled at startup, and the [standalone Android Note Version Recorder](https://github.com/neuronsarealsocool/note-version-recorder) can supply intermediate saved versions through Resilio Sync. Historical imports reconstruct existing backward patches before inserting full snapshots, preserving old history. Repeated journal events are ignored. This release also supports long Windows note titles and schedules a trailing save after throttled edits. See [setup and limitations](OFFLINE-HISTORY.txt).
+
 This fork of [Antonio Tejada's Edit History](https://github.com/antoniotejada/obsidian-edit-history) adds a configurable external backup directory for desktop filesystem vaults. It retains the upstream plugin ID (`edit-history`), settings, `.edtz` format, and history viewer.
 
 ## External backup directory (0.4.0)

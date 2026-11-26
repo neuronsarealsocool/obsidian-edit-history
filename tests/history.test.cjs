@@ -15,6 +15,7 @@ function loadCode(code, obsidian = {}) {
         require: name => name === 'obsidian' ? obsidian : require(name),
         process, Buffer, ArrayBuffer, Uint8Array, Date, console, setTimeout, clearTimeout, setImmediate, clearImmediate,
         document: obsidian.document, navigator: {}, createEl: obsidian.createEl,
+        window: {setInterval:()=>0, setTimeout:()=>0, clearTimeout(){}},
     });
     return module.exports;
 }
@@ -73,6 +74,12 @@ test('blank setting preserves original vault storage', async t => {
     assert.equal(text(await store.read('elsewhere/n.md.edtz')), 'legacy');
     await store.remove('elsewhere/n.md.edtz');
     assert.equal(await store.stat('elsewhere/n.md.edtz'), null);
+});
+
+test('long Windows note titles use short atomic temporary names and safe archive names', async t => {
+    const f=await fixture(t),store=new HistoryStorage(f.adapter,f.external,f.vault);
+    for(const length of [240,252]){const name='notes/'+'x'.repeat(length)+'.md.edtz';await store.write(name,bytes('Original'));await store.write(name,bytes('Updated'));assert.equal(text(await store.read(name)),'Updated');}
+    const files=await fs.readdir(path.join(store.directory,'notes'));assert.equal(files.length,2);assert.ok(files.every(name=>name.length<=255&&!name.endsWith('.tmp')));
 });
 
 test('same backup root separates vault identities, including vaults with identical names', async t => {
@@ -149,7 +156,7 @@ function mockObsidian(adapter) {
     });
     class Plugin {
         async loadData() { return {}; } async saveData(data) { this.saved = { ...data }; }
-        registerEvent() {} addCommand(c) { (this.commands ||= []).push(c); }
+        registerEvent() {} registerInterval() {} addCommand(c) { (this.commands ||= []).push(c); }
         addRibbonIcon() {} addStatusBarItem() { return document.createElement('div'); }
         addSettingTab(tab) { this.tab = tab; }
     }
@@ -255,4 +262,28 @@ test('plugin settings, import, revision reconstruction, modal, queue, renames an
     await plugin.applyBackupDirectory('');
     assert.equal(plugin.historyStorage().directory, '');
     assert.equal(obsidian.notices.some(n => n.startsWith('Edit History:')), false);
+});
+
+test('startup catches offline edits and late Android imports preserve every old revision without duplicates', async t => {
+    const f=await fixture(t), obsidian=mockObsidian(f.adapter);t.after(()=>obsidian.dom.window.close());
+    const EditHistory=loadCode(await fs.readFile('main.js','utf8'),obsidian).default;
+    const note=new obsidian.TFile('note.md');let content='Original paragraph. '.repeat(40);
+    note.stat.mtime=Date.now()-200000;const handlers={};
+    const app={vault:{adapter:f.adapter,on:(name,fn)=>{handlers[name]=fn;},read:async()=>content,getFiles:()=>[note],getAbstractFileByPath:()=>note},workspace:{getActiveFile:()=>note}};
+    const plugin=new EditHistory();plugin.app=app;await plugin.onload();await handlers.modify(note,true);const original=content;
+    content+='Desktop change';note.stat.mtime+=100000;await handlers.modify(note,true);const desktop=content;
+    // No modify event: only startup reconciliation sees this final synced version.
+    content+=' Final mobile text';note.stat.mtime+=90000;await plugin.reconcileHistory();
+    const archivePath=plugin.getEditHistoryFilepath(note.path);let zip=await JSZip.loadAsync(await plugin.historyStorage().read(archivePath));assert.equal(Object.keys(zip.files).length,3);
+    const device='00000000-0000-4000-8000-000000000010';
+    const mobile=(n,before,after,offset)=>({schema:1,id:'00000000-0000-4000-8000-'+String(n).padStart(12,'0'),deviceId:device,path:note.path,kind:'edit',previousContent:before,content:after,capturedAt:new Date(Date.now()+offset).toISOString(),modifiedAt:Date.now()+offset,day:'2026-11-26',offsetMinutes:660,basis:'file-mtime'});
+    const intermediate=desktop+' Phone intermediate';const records=[mobile(11,desktop,intermediate,-50000),mobile(12,intermediate,content,-10000)];
+    plugin.mobileReader={readAll:async()=>records};await plugin.importMobileHistory();
+    const once=await plugin.historyStorage().read(archivePath);zip=await JSZip.loadAsync(once);const values=await Promise.all(Object.keys(zip.files).map(name=>zip.file(name).async('string')));
+    for(const expected of [original,desktop,intermediate,content])assert.ok(values.includes(expected));
+    assert.ok(Object.keys(zip.files).every(name=>name.endsWith('$'))); // Imported older versions cannot break a backward patch chain.
+    await plugin.importMobileHistory();assert.deepEqual(Buffer.from(await plugin.historyStorage().read(archivePath)),Buffer.from(once));
+    const reopened=new EditHistory();reopened.app=app;await reopened.onload();reopened.mobileReader={readAll:async()=>records};await reopened.importMobileHistory();assert.deepEqual(Buffer.from(await reopened.historyStorage().read(archivePath)),Buffer.from(once));
+    content+=' Another offline change';note.stat.mtime-=90000;await reopened.reconcileHistory();
+    const finalZip=await JSZip.loadAsync(await reopened.historyStorage().read(archivePath));const names=Object.keys(finalZip.files);reopened.sortEdits(names);assert.equal(await finalZip.file(names[0]).async('string'),content);
 });

@@ -42,6 +42,10 @@ export class HistoryStorage {
         if (!relative || parts.some(part => part === ".." || part === "." || part.includes(":")) || relative.startsWith("/")) {
             throw new Error("Invalid history path.");
         }
+        // A legal 255-character note name may exceed NTFS's component limit once .edtz is added.
+        const leaf = parts[parts.length - 1];
+        if (leaf.length > 255 && leaf.endsWith('.edtz')) parts[parts.length - 1] =
+            Array.from(leaf.slice(0,-5)).slice(0,80).join('') + '~' + require('crypto').createHash('sha256').update(leaf).digest('hex').slice(0,24) + '.edtz';
         return this.path.join(this.directory, ...parts);
     }
 
@@ -90,7 +94,7 @@ export class HistoryStorage {
         const target = this.location(relative);
         await this.fs.mkdir(this.path.dirname(target), { recursive: true });
         // Replace the complete archive only after the new archive is on disk.
-        const temporary = target + `.tmp-${require("crypto").randomBytes(8).toString("hex")}`;
+        const temporary = this.path.join(this.path.dirname(target), `.edit-history-${require("crypto").randomBytes(8).toString("hex")}.tmp`);
         try {
             await this.fs.writeFile(temporary, Buffer.from(data), { flag: "wx" });
             await this.fs.rename(temporary, target);
