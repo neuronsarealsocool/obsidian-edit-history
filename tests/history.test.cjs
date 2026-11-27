@@ -287,3 +287,60 @@ test('startup catches offline edits and late Android imports preserve every old 
     content+=' Another offline change';note.stat.mtime-=90000;await reopened.reconcileHistory();
     const finalZip=await JSZip.loadAsync(await reopened.historyStorage().read(archivePath));const names=Object.keys(finalZip.files);reopened.sortEdits(names);assert.equal(await finalZip.file(names[0]).async('string'),content);
 });
+
+test('same-second Android snapshots do not interrupt desktop reconstruction, import or viewing', async t => {
+    const f=await fixture(t),obsidian=mockObsidian(f.adapter);t.after(()=>obsidian.dom.window.close());
+    const EditHistory=loadCode(await fs.readFile('main.js','utf8'),obsidian).default;
+    const plugin=new EditHistory(),note=new obsidian.TFile('note.md');
+    const original='An intact archived paragraph. '.repeat(50),middle=original+' Desktop change',latest=middle+' Latest change';
+    let content=latest;const t0=Math.floor(Date.now()/1000)*1000;
+    const app={vault:{adapter:f.adapter,on:()=>({}),read:async()=>content,getFiles:()=>[note]},workspace:{getActiveFile:()=>note}};
+    plugin.app=app;await plugin.onload();
+    const patchName=plugin.buildEditFilename(t0-10000,true),latestName=plugin.buildEditFilename(t0,false);
+    const oldName=plugin.buildEditFilename(t0-20000,false),prefix=plugin.buildEditFilename(t0-10000,false).slice(0,-1);
+    const before=prefix+'~00000000-0000-4000-8000-000000000001-0-before$',after=prefix+'~00000000-0000-4000-8000-000000000001-1-edit$';
+    const zip=new JSZip(),dmp=new DiffMatchPatch();
+    zip.file(latestName,latest);zip.file(patchName,dmp.patch_toText(dmp.patch_make(latest,middle)));
+    zip.file(before,'');zip.file(after,middle);zip.file(oldName,original);
+    const expected=new Map([[latestName,latest],[patchName,middle],[before,''],[after,middle],[oldName,original]]);
+    const reconstructed=await plugin.reconstructHistory(zip);
+    for(const [name,value] of expected)assert.equal(reconstructed.get(name),value);
+    const archivePath=plugin.getEditHistoryFilepath(note.path);await plugin.historyStorage().write(archivePath,await zip.generateAsync({type:'arraybuffer'}));
+    // The viewer must use the same reconstruction as the importer.
+    plugin.commands.find(c=>c.id==='open-edit-history').checkCallback(false);
+    for(let i=0;i<obsidian.pendingUI.length;i++)await obsidian.pendingUI[i];
+    const modal=obsidian.Modal.last,selects=modal.contentEl.querySelectorAll('select');
+    selects[0].value=patchName;selects[0].dispatchEvent(new obsidian.dom.window.Event('change'));
+    for(let i=0;i<obsidian.pendingUI.length;i++)await obsidian.pendingUI[i];
+    assert.equal(modal.currentVersionData,middle);
+    selects[1].value='TIMELINE';selects[1].dispatchEvent(new obsidian.dom.window.Event('change'));
+    for(let i=0;i<obsidian.pendingUI.length;i++)await obsidian.pendingUI[i];
+    assert.equal(modal.currentVersionData,middle);
+    const record={schema:1,id:'00000000-0000-4000-8000-000000000002',deviceId:'00000000-0000-4000-8000-000000000003',path:note.path,kind:'edit',previousContent:latest,content:latest+' Phone edit',capturedAt:new Date(t0+10000).toISOString(),modifiedAt:t0+10000,day:'2026-11-27',offsetMinutes:660,basis:'file-mtime'};
+    plugin.mobileReader={readAll:async()=>[record]};await plugin.importMobileHistory();
+    assert.equal(plugin.lastHistoryError,'');
+    let imported=await JSZip.loadAsync(await plugin.historyStorage().read(archivePath));
+    for(const [name,value] of expected)assert.equal(await imported.file(name.endsWith('$')?name:name+'$').async('string'),value);
+    const mobileName=Object.keys(imported.files).find(n=>n.includes(record.id)&&n.endsWith('-1-edit$'));
+    assert.ok(mobileName);content=record.content+' Desktop edit after phone';note.stat.mtime=t0+20000;
+    await plugin.saveFileHistory(note,true);
+    const saved=await plugin.historyStorage().read(archivePath);imported=await JSZip.loadAsync(saved);
+    assert.equal(await imported.file(mobileName).async('string'),record.content);
+    const reopened=new EditHistory();reopened.app=app;await reopened.onload();reopened.mobileReader={readAll:async()=>[record]};
+    await reopened.importMobileHistory();assert.deepEqual(Buffer.from(await reopened.historyStorage().read(archivePath)),Buffer.from(saved));
+    assert.equal(obsidian.notices.some(n=>n.startsWith('Edit History:')),false);
+});
+
+test('genuinely broken patches leave the archive bytes and pending mobile records intact', async t => {
+    const f=await fixture(t),obsidian=mockObsidian(f.adapter);t.after(()=>obsidian.dom.window.close());
+    const EditHistory=loadCode(await fs.readFile('main.js','utf8'),obsidian).default,plugin=new EditHistory();
+    plugin.app={vault:{adapter:f.adapter,on:()=>({}),getFiles:()=>[]},workspace:{getActiveFile:()=>null}};await plugin.onload();
+    const zip=new JSZip(),dmp=new DiffMatchPatch();zip.file('300$', 'Entirely unrelated snapshot');
+    zip.file('200',dmp.patch_toText(dmp.patch_make('x'.repeat(100),'y'.repeat(100))));
+    const archivePath=plugin.getEditHistoryFilepath('broken.md'),saved=await zip.generateAsync({type:'arraybuffer'});await plugin.historyStorage().write(archivePath,saved);
+    await assert.rejects(plugin.reconstructHistory(zip),/200; archive preserved/);
+    const record={id:'00000000-0000-4000-8000-000000000004',path:'broken.md',kind:'baseline',content:'Pending full snapshot',modifiedAt:Date.now(),basis:'file-mtime',capturedAt:new Date().toISOString()};
+    plugin.mobileReader={readAll:async()=>[record]};await plugin.importMobileHistory();
+    assert.deepEqual(Buffer.from(await plugin.historyStorage().read(archivePath)),Buffer.from(saved));
+    assert.equal(plugin.mobileSeen.has(record.id),false);assert.match(plugin.lastHistoryError,/archive preserved/);
+});

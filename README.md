@@ -1,5 +1,9 @@
 # Obsidian Edit History — External Backups fork
 
+## Android reconstruction fix (0.5.1)
+
+Android snapshots remain independent of the desktop backward-patch chain, even when their timestamps share a second. The importer and history viewer use the same validated reconstruction. Desktop saves retain imported snapshot names and IDs, so they cannot trigger duplicate imports. Archives that genuinely fail reconstruction remain unchanged, with their pending mobile records retained for recovery.
+
 ## Offline catch-up and Android recording (0.5.0)
 
 Eligible notes are reconciled at startup, and the [standalone Android Note Version Recorder](https://github.com/neuronsarealsocool/note-version-recorder) can supply intermediate saved versions through Resilio Sync. Historical imports reconstruct existing backward patches before inserting full snapshots, preserving old history. Repeated journal events are ignored. This release also supports long Windows note titles and schedules a trailing save after throttled edits. See [setup and limitations](OFFLINE-HISTORY.txt).

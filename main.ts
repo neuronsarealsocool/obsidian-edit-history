@@ -159,7 +159,7 @@ const EDIT_HISTORY_FILE_EXT = ".edtz";
 //     be done without private apis by inserting the text in edit history order at file
 //     load, will probably need a flag to prevent from storing double history)
 
-// XXX Allow management in the edit history modal, merging diffs, deleting, deleting all historyç
+// XXX Allow management in the edit history modal, merging diffs, deleting, deleting all historyÃ§
 
 // XXX tgz reduces size by half, use native browser gzip plus tar? (at the
 //     expense of having to uncompress the whole file in memory, not clear jszip
@@ -357,6 +357,30 @@ export default class EditHistory extends Plugin {
         // XXX Could do .length plus < checks, though, removing trailing $ when
         //     necessary)
         filenames.sort((a,b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a) || b.localeCompare(a)));
+    }
+
+    async reconstructHistory(zip: JSZip): Promise<Map<string,string>> {
+        const names = Object.keys(zip.files).filter(name => !zip.files[name].dir);
+        this.sortEdits(names);
+        const versions = new Map<string,string>();
+        const dmp = new DiffMatchPatch();
+        let desktopContent: string | undefined;
+        for (const name of names) {
+            const value = await zip.file(name).async('string');
+            if (!this.getEditIsDiff(name)) {
+                versions.set(name,value);
+                // Android observations are independent full snapshots. They
+                // cannot replace the base of a desktop backward-patch chain.
+                if (!name.includes('~')) desktopContent = value;
+            } else {
+                if (desktopContent === undefined) throw Error(`No full desktop snapshot for ${name}; archive preserved`);
+                const applied = dmp.patch_apply(dmp.patch_fromText(value),desktopContent);
+                if (applied[1].some(ok=>!ok)) throw Error(`Existing history could not be reconstructed at ${name}; archive preserved`);
+                desktopContent = applied[0];
+                versions.set(name,desktopContent);
+            }
+        }
+        return versions;
     }
 
     commaSeparatedToList(s: string) {
@@ -655,16 +679,15 @@ export default class EditHistory extends Plugin {
                         
                         // Don't bother replacing with the diffed version if
                         // the diff is larger than the original
-                        if (patch.length < prevFileData.length) {
+                        // Keep imported snapshot identities intact so a later
+                        // desktop save cannot trigger a duplicate mobile import.
+                        if (patch.length < prevFileData.length && !mostRecentFilename.includes('~')) {
                             // Replace the previous version with a diff wrt the
                             // newest version
                             logInfo("Removing ", mostRecentFilename);
                             zip.remove(mostRecentFilename);
                             // Store as a diff
-                            mostRecentFilename = this.buildEditFilename(
-                                this.getEditEpoch(mostRecentFilename), 
-                                true
-                            );
+                            mostRecentFilename = mostRecentFilename.slice(0,-1);
                             logInfo("Storing ", mostRecentFilename, " with date ", 
                                 mostRecentFile.date, " timestamp ", mostRecentFile.extendedTimestamp);
                             // XXX Investigate why there's no need to undo
@@ -884,17 +907,12 @@ export default class EditHistory extends Plugin {
                     if (!pending.length) {records.forEach(r=>this.mobileSeen.add(r.id)); return;}
                     // Insert historical versions without changing the meaning of existing backward patches.
                     const names = Object.keys(zip.files).filter(name=>!zip.files[name].dir); this.sortEdits(names);
-                    const full = new JSZip(); let content: string | undefined;
-                    const dmp = new DiffMatchPatch();
+                    const full = new JSZip();
+                    const versions = await this.reconstructHistory(zip);
                     for (const name of names) {
-                        const value = await zip.file(name).async('string');
-                        if (this.getEditIsDiff(name)) {
-                            if (content === undefined) throw Error('The latest existing history entry is not a full snapshot');
-                            const applied = dmp.patch_apply(dmp.patch_fromText(value),content);
-                            if (applied[1].some(ok=>!ok)) throw Error('Existing history could not be reconstructed; archive preserved');
-                            content = applied[0];
-                        } else content = value;
-                        full.file(name.endsWith('$')?name:name+'$',content,{date:zip.file(name).date,comment:zip.file(name).comment || '',compression:'DEFLATE'});
+                        const target = name.endsWith('$')?name:name+'$';
+                        if (full.file(target)) throw Error(`Conflicting history entries at ${target}; archive preserved`);
+                        full.file(target,versions.get(name)!,{date:zip.file(name).date,comment:zip.file(name).comment || '',compression:'DEFLATE'});
                     }
                     for (const record of pending) {
                         const name = this.buildMobileFilename(record), date = new Date(mobileTime(record));
@@ -922,6 +940,7 @@ class EditHistoryModal extends Modal {
     currentVersionData: string;
     curDiffIndex: number;
     diffElements: NodeListOf<HTMLElement>;
+    private historyVersions = new Map<string,string>();
     
     constructor(plugin: EditHistory) { 
         super(plugin.app);
@@ -1142,16 +1161,8 @@ class EditHistoryModal extends Modal {
             // - once found, keep rebuilding versions and also store the time
             //   annotation for each line (ie time of the edit that most
             //   recently modified that line)
-            const diff = await zip.file(filepath).async("string");
             newerData = data;
-            if (this.plugin.getEditIsDiff(filepath)) {
-                // Rebuild the data from the diff applied to the current data
-                const patch = dmpobj.patch_fromText(diff);
-                data = dmpobj.patch_apply(patch, data)[0];
-            } else {
-                // The full file was stored, there's no diff
-                data = diff;
-            }
+            data = this.historyVersions.get(filepath)!;
             if (!annotate && (selectedEdit == filepath)) {
                 // Note split returns 2 for a string with a single \n, no need
                 // to +1
@@ -1461,6 +1472,12 @@ class EditHistoryModal extends Modal {
         // seems to list in creation order already)
         this.plugin.sortEdits(filepaths);
 
+        try { this.historyVersions = await this.plugin.reconstructHistory(zip); }
+        catch (error) {
+            contentEl.createEl('p',{text:`Unable to reconstruct edit history: ${error.message || error}`});
+            return;
+        }
+
         const dmpobj = new DiffMatchPatch();
         
         // XXX Allow searching in the diff text rendering
@@ -1621,17 +1638,7 @@ class EditHistoryModal extends Modal {
                 // to selected can be displayed
                 let diff = await zip.file(filepath).async("string");
                 
-                if (this.plugin.getEditIsDiff(filepath)) {
-                    // Rebuild the data from the diff applied to the current
-                    // data
-                    let patch = dmpobj.patch_fromText(diff);
-                    // XXX This could collect patches and apply them in a
-                    //     single call after the loop, not clear it's faster
-                    data = dmpobj.patch_apply(patch, data)[0];
-                } else {
-                    // The full file was stored, there's no diff
-                    data = diff;
-                }
+                data = this.historyVersions.get(filepath)!;
 
                 if (found) {
                     previousFound = true;

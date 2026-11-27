@@ -1,7 +1,7 @@
 {
   "id": "edit-history",
   "name": "Edit History (External Backups)",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "minAppVersion": "0.15.0",
   "description": "Save and browse note edit history, with an optional external backup directory and separate storage for each vault.",
   "author": "Antonio Tejada; external-backup fork by neuronsarealsocool",
